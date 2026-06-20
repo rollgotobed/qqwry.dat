@@ -15,7 +15,7 @@ class QQWryPacker {
     const endIPInt = this._ipToInt(endIP)
     const geoOffset = this.maxRecordOffset
     this._createRecord(endIPInt, country, area || 'CZ88.NET')
-    this.ipTree.set(startIPInt, { endIPInt, geoOffset })
+    this.ipTree.set(startIPInt, { endIPInt, geoOffset, country, area: area || 'CZ88.NET' })
   }
 
   // 生成最终的二进制文件
@@ -26,13 +26,12 @@ class QQWryPacker {
     // 2. 构造索引区
     const sortedIPs = Array.from(this.ipTree.keys()).sort((a, b) => a - b)
     const indexList = []
-    
+
     for (let i = 0; i < sortedIPs.length; i++) {
-      // [startIP, nextOffset]
-      const startIP = sortedIPs[i]
-      const { geoOffset } = this.ipTree.get(startIP)
+      const startIPInt = sortedIPs[i]
+      const { geoOffset } = this.ipTree.get(startIPInt)
       const indexRecord = Buffer.alloc(7)
-      indexRecord.writeUInt32LE(startIP, 0)
+      indexRecord.writeUInt32LE(startIPInt, 0)
       if (geoOffset > 0xFFFFFF) {
         throw new Error('Offset overflow')
       }
@@ -46,6 +45,13 @@ class QQWryPacker {
     const headerBuffer = Buffer.alloc(8)
     headerBuffer.writeUInt32LE(8 + recordBuffer.length, 0)
     headerBuffer.writeUInt32LE(8 + recordBuffer.length + sortedIPs.length * 7 - 7, 4)
+
+    console.log([
+      '文件头长度:', headerBuffer.length,
+      '记录区长度:', recordBuffer.length,
+      '索引区长度:', Buffer.concat(indexList).length,
+      '记录数:', sortedIPs.length,
+    ])
 
     // 4. 合并所有部分
     return Buffer.concat([
@@ -86,23 +92,35 @@ class QQWryPacker {
 
     // country, area 分开都有的记录
     if (this.stringCache.has(country) && this.stringCache.has(area)) {
-      const redirectBuf = Buffer.alloc(4)
-      redirectBuf.writeUInt8(0x01, 0)
-      const nextOffset = this.maxRecordOffset + 4
-      redirectBuf.writeUInt8((nextOffset >> 0) & 0xFF, 1)
-      redirectBuf.writeUInt8((nextOffset >> 8) & 0xFF, 2)
-      redirectBuf.writeUInt8((nextOffset >> 16) & 0xFF, 3)
-      this.recordList.push(redirectBuf)
-      this.maxRecordOffset += redirectBuf.length
-
       const countryOffset = this.stringCache.get(country)
+      const areaOffset = this.stringCache.get(area)
+
+      // 生成缓存键:基于两个偏移的组合
+      const ptrCacheKey = `ptr:${countryOffset}:${areaOffset}`
+
+      // 检查是否已有相同的指针组合
+      if (this.stringCache.has(ptrCacheKey)) {
+        // 复用:用 0x01 重定向到已有的 8 字节块
+        const existingOffset = this.stringCache.get(ptrCacheKey)
+        const redirectBuf = Buffer.alloc(4)
+        redirectBuf.writeUInt8(0x01, 0)
+        redirectBuf.writeUInt8((existingOffset >> 0) & 0xFF, 1)
+        redirectBuf.writeUInt8((existingOffset >> 8) & 0xFF, 2)
+        redirectBuf.writeUInt8((existingOffset >> 16) & 0xFF, 3)
+        this.recordList.push(redirectBuf)
+        this.maxRecordOffset += 4
+        return
+      }
+
+      // 首次出现:直接写入 8 字节(省略 0x01 层)
+      const currentOffset = this.maxRecordOffset
+
       const countryBuf = Buffer.alloc(4)
       countryBuf.writeUInt8(0x02, 0)
       countryBuf.writeUInt8((countryOffset >> 0) & 0xFF, 1)
       countryBuf.writeUInt8((countryOffset >> 8) & 0xFF, 2)
       countryBuf.writeUInt8((countryOffset >> 16) & 0xFF, 3)
 
-      const areaOffset = this.stringCache.get(area)
       const areaBuf = Buffer.alloc(4)
       areaBuf.writeUInt8(0x02, 0)
       areaBuf.writeUInt8((areaOffset >> 0) & 0xFF, 1)
@@ -111,9 +129,12 @@ class QQWryPacker {
 
       this.recordList.push(countryBuf)
       this.recordList.push(areaBuf)
-      this.maxRecordOffset += countryBuf.length + areaBuf.length
-      // 缓存
-      this.stringCache.set(`${country}\t${area}`, nextOffset)
+      this.maxRecordOffset += 8
+
+      // 缓存这个 8 字节块的位置
+      this.stringCache.set(ptrCacheKey, currentOffset)
+      // 保持原有的组合缓存(用于策略 1)
+      this.stringCache.set(`${country}\t${area}`, currentOffset)
       return
     }
 
@@ -137,6 +158,8 @@ class QQWryPacker {
       this.maxRecordOffset += countryBuf.length + areaBuf.length
 
       // 缓存
+      const areaOffset = currentOffset + countryBuf.length
+      this.stringCache.set(area, areaOffset)
       this.stringCache.set(`${country}\t${area}`, currentOffset)
       return
     }
@@ -157,7 +180,9 @@ class QQWryPacker {
     this.maxRecordOffset += countryBuf.length + areaBuf.length
 
     // 缓存
+    const areaOffset = currentOffset + countryBuf.length
     this.stringCache.set(`${country}`, currentOffset)
+    this.stringCache.set(area, areaOffset)
     this.stringCache.set(`${country}\t${area}`, currentOffset)
   }
 }
